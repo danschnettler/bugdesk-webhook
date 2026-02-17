@@ -15,7 +15,8 @@ npm install
 | `PORT` | Server port (default: 3000) |
 | `STRIPE_SECRET_KEY` | Stripe secret key (sk_...) |
 | `STRIPE_WEBHOOK_SECRET` | Webhook signing secret (whsec_...) from Stripe Dashboard → Developers → Webhooks |
-| `GHL_API_KEY` | Go High Level API key for creating/updating contacts |
+| `GHL_API_KEY` | Go High Level **Private Integration** token (Settings → Private Integrations). Not the legacy API key. |
+| `GHL_SUB_ACCOUNT_ID` | Sub-account ID (required when creating new contacts; use the sub-account where contacts should be created) |
 
 Create a `.env` file (do not commit it) or set these in your environment.
 

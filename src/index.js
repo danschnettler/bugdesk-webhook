@@ -18,26 +18,33 @@ function toGHLCustomFieldsArray(obj) {
     .map(([key, value]) => ({ key, value }));
 }
 
-// Helper: Send request to Go High Level API
+// GHL Private Integrations use this base URL and require the Version header.
+const GHL_BASE = 'https://services.leadconnectorhq.com';
+const GHL_VERSION = '2021-07-28';
+
+// Helper: Send request to Go High Level API (Private Integration)
 async function updateGHLContact({ email, ghlContactId, tags = [], customFields = {} }) {
+  const subAccountId = process.env.GHL_SUB_ACCOUNT_ID;
   const body = {
+    ...(subAccountId && { locationId: subAccountId }),
     email,
     tags,
     customFields: toGHLCustomFieldsArray(customFields),
   };
 
-  const apiKey = process.env.GHL_API_KEY;
-  if (!apiKey) {
+  const token = process.env.GHL_API_KEY;
+  if (!token) {
     throw new Error('GHL_API_KEY is not set');
   }
 
   const headers = {
-    Authorization: `Bearer ${apiKey}`,
+    Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
+    Version: GHL_VERSION,
   };
 
   if (ghlContactId) {
-    const res = await fetch(`https://rest.gohighlevel.com/v1/contacts/${ghlContactId}`, {
+    const res = await fetch(`${GHL_BASE}/contacts/${ghlContactId}`, {
       method: 'PUT',
       headers,
       body: JSON.stringify(body),
@@ -47,7 +54,7 @@ async function updateGHLContact({ email, ghlContactId, tags = [], customFields =
       throw new Error(`GHL PUT contact failed ${res.status}: ${text}`);
     }
   } else {
-    const res = await fetch('https://rest.gohighlevel.com/v1/contacts/', {
+    const res = await fetch(`${GHL_BASE}/contacts/`, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
