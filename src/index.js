@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import Stripe from 'stripe';
 
@@ -10,12 +11,19 @@ if (!webhookSecret) {
   console.warn('STRIPE_WEBHOOK_SECRET is not set; webhook signature verification will fail.');
 }
 
+// Convert { key: value } to GHL format: [ { key, value } ]. Omit null/undefined values.
+function toGHLCustomFieldsArray(obj) {
+  return Object.entries(obj)
+    .filter(([, value]) => value != null)
+    .map(([key, value]) => ({ key, value }));
+}
+
 // Helper: Send request to Go High Level API
 async function updateGHLContact({ email, ghlContactId, tags = [], customFields = {} }) {
   const body = {
     email,
     tags,
-    customFields,
+    customFields: toGHLCustomFieldsArray(customFields),
   };
 
   const apiKey = process.env.GHL_API_KEY;
