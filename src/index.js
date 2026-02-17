@@ -65,6 +65,7 @@ app.post(
   '/webhook',
   express.raw({ type: 'application/json' }),
   async (req, res) => {
+    console.log('[webhook] Request received');
     const sig = req.headers['stripe-signature'];
 
     if (!sig || !webhookSecret) {
@@ -78,6 +79,8 @@ app.post(
       console.error('⚠️ Webhook signature verification failed:', err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
+
+    console.log('[webhook] Event verified:', event.type, event.id);
 
     try {
       switch (event.type) {
@@ -161,7 +164,8 @@ app.post(
 
       res.json({ received: true });
     } catch (err) {
-      console.error('⚠️ Error processing webhook:', err);
+      console.error('⚠️ Error processing webhook:', err.message);
+      if (err.stack) console.error(err.stack);
       res.status(500).send('Internal Server Error');
     }
   }
