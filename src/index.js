@@ -54,14 +54,15 @@ async function updateGHLContact({ email, ghlContactId, tags = [], customFields =
       throw new Error(`GHL PUT contact failed ${res.status}: ${text}`);
     }
   } else {
-    const res = await fetch(`${GHL_BASE}/contacts/`, {
+    // Upsert: create or update by email so we don't fail when location disallows duplicates
+    const res = await fetch(`${GHL_BASE}/contacts/upsert`, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
     });
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`GHL POST contact failed ${res.status}: ${text}`);
+      throw new Error(`GHL POST contact upsert failed ${res.status}: ${text}`);
     }
   }
 }
