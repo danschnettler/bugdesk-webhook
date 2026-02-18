@@ -47,11 +47,34 @@ function getGHLHeaders() {
 async function getCustomerDetails(customerId) {
   if (!customerId) return { email: null, name: null, phone: null };
   try {
-    const customer = await stripe.customers.retrieve(extractId(customerId));
+    const customerIdStr = extractId(customerId);
+    console.log(`[getCustomerDetails] Fetching customer: ${customerIdStr}`);
+    const customer = await stripe.customers.retrieve(customerIdStr);
+    
+    // Debug: Log what we got from Stripe
+    console.log(`[getCustomerDetails] Customer object fields:`);
+    console.log(`  - email: ${customer.email || 'N/A'}`);
+    console.log(`  - name: ${customer.name || 'N/A'}`);
+    console.log(`  - phone: ${customer.phone || 'N/A'}`);
+    console.log(`  - metadata.phone: ${customer.metadata?.phone || 'N/A'}`);
+    console.log(`  - Full customer object (relevant fields):`, JSON.stringify({
+      id: customer.id,
+      email: customer.email,
+      name: customer.name,
+      phone: customer.phone,
+      metadata: customer.metadata
+    }, null, 2));
+    
+    // Check multiple possible phone fields
+    const phone = customer.phone 
+      || customer.metadata?.phone 
+      || customer.shipping?.phone  // Sometimes in shipping
+      || null;
+    
     return {
       email: customer.email || null,
       name: customer.name || null,
-      phone: customer.phone || customer.metadata?.phone || null,
+      phone: phone,
     };
   } catch (err) {
     console.warn(`Failed to fetch customer ${customerId}:`, err.message);
@@ -304,6 +327,27 @@ app.post(
           
           console.log(`[Checkout Completed] Session ID: ${session.id}, Mode: ${session.mode}, Subscription: ${session.subscription || 'none'}`);
           
+          // Debug: Check if Link was used
+          const paymentMethodTypes = session.payment_method_types || [];
+          const usedLink = paymentMethodTypes.includes('link');
+          console.log(`[Checkout Completed] Payment Methods: ${paymentMethodTypes.join(', ')}`);
+          console.log(`[Checkout Completed] Used Stripe Link: ${usedLink}`);
+          
+          // Debug: Check phone collection settings
+          console.log(`[Checkout Completed] Phone Collection Enabled: ${session.phone_number_collection?.enabled || false}`);
+          
+          // Debug: Log what's available in customer_details
+          console.log(`[Checkout Completed] Customer Details Available:`);
+          console.log(`  - Email: ${session.customer_details?.email || 'N/A'}`);
+          console.log(`  - Name: ${session.customer_details?.name || 'N/A'}`);
+          console.log(`  - Phone: ${session.customer_details?.phone || 'N/A'}`);
+          console.log(`  - Full customer_details:`, JSON.stringify(session.customer_details, null, 2));
+          
+          // Check if payment was made with Link (Link stores customer info in their account)
+          if (usedLink) {
+            console.log(`[Checkout Completed] Link detected - customer may have saved phone in Link account`);
+          }
+          
           // Get email, name, and phone from session or customer
           let email = session.customer_details?.email;
           let name = session.customer_details?.name;
@@ -311,11 +355,21 @@ app.post(
           
           // If not in session details, fetch from customer
           if (session.customer && (!email || !name || !phone)) {
+            console.log(`[Checkout Completed] Fetching customer details for: ${extractId(session.customer)}`);
             const customerDetails = await getCustomerDetails(session.customer);
+            console.log(`[Checkout Completed] Customer Details from API:`);
+            console.log(`  - Email: ${customerDetails.email || 'N/A'}`);
+            console.log(`  - Name: ${customerDetails.name || 'N/A'}`);
+            console.log(`  - Phone: ${customerDetails.phone || 'N/A'}`);
             email = email || customerDetails.email;
             name = name || customerDetails.name;
             phone = phone || customerDetails.phone;
           }
+          
+          console.log(`[Checkout Completed] Final Values:`);
+          console.log(`  - Email: ${email || 'N/A'}`);
+          console.log(`  - Name: ${name || 'N/A'}`);
+          console.log(`  - Phone: ${phone || 'N/A'}`);
           
           // If this checkout created a subscription, process it immediately
           if (session.mode === 'subscription' && session.subscription) {
