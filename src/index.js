@@ -100,6 +100,8 @@ async function fetchFullSubscription(subscriptionId) {
 
 // Helper: Process subscription event (created/updated/deleted)
 async function processSubscriptionEvent(sub, tags, statusOverride = null) {
+  console.log(`[processSubscriptionEvent] Processing subscription ${sub.id} with tags: ${tags.join(', ')}`);
+  
   const fullSub = await fetchFullSubscription(sub.id);
   const metadata = fullSub.metadata || {};
   
@@ -112,6 +114,8 @@ async function processSubscriptionEvent(sub, tags, statusOverride = null) {
   const name = await getNameFromEvent(metadata, fullSub.customer, customerDetails);
   const phone = await getPhoneFromEvent(metadata, fullSub.customer, customerDetails);
   const ghlContactId = metadata.ghl_contact_id || null;
+  
+  console.log(`[processSubscriptionEvent] Email: ${email}, GHL Contact ID from metadata: ${ghlContactId || 'none'}`);
   
   const subscriptionData = extractSubscriptionData(fullSub);
   if (statusOverride) {
@@ -127,8 +131,12 @@ async function processSubscriptionEvent(sub, tags, statusOverride = null) {
     customFields: subscriptionData,
   });
   
+  console.log(`[processSubscriptionEvent] Contact ID after update: ${contactId || 'NOT FOUND'}`);
+  
   if (contactId) {
     await syncGHLSubscription({ contactId, subscriptionData });
+  } else {
+    console.warn('[processSubscriptionEvent] No contact ID returned, skipping subscription sync');
   }
   
   return { email, name, phone, contactId, hasTrial: fullSub.trial_end && fullSub.trial_end > Math.floor(Date.now() / 1000) };
@@ -331,6 +339,8 @@ app.post(
           const session = event.data.object;
           const metadata = session.metadata || {};
           
+          console.log(`[Checkout Completed] Session ID: ${session.id}, Mode: ${session.mode}, Subscription: ${session.subscription || 'none'}`);
+          
           // Get email, name, and phone from session or customer
           let email = session.customer_details?.email;
           let name = session.customer_details?.name;
@@ -344,24 +354,72 @@ app.post(
             phone = phone || customerDetails.phone;
           }
           
-          await updateGHLContact({
-            email,
-            name,
-            phone,
-            ghlContactId: metadata.ghl_contact_id || null,
-            tags: [],
-            customFields: {
-              stripe_customer_id: extractId(session.customer),
-              stripe_checkout_id: session.id,
-            },
-          });
+          // If this checkout created a subscription, process it immediately
+          if (session.mode === 'subscription' && session.subscription) {
+            console.log(`[Checkout Completed] Subscription detected: ${session.subscription}, processing...`);
+            try {
+              const fullSub = await fetchFullSubscription(session.subscription);
+              const hasTrial = fullSub.trial_end && fullSub.trial_end > Math.floor(Date.now() / 1000);
+              
+              const subscriptionData = extractSubscriptionData(fullSub);
+              
+              const contactId = await updateGHLContact({
+                email,
+                name,
+                phone,
+                ghlContactId: metadata.ghl_contact_id || null,
+                tags: hasTrial ? ['is_trialing'] : [],
+                customFields: {
+                  ...subscriptionData,
+                  stripe_checkout_id: session.id,
+                },
+              });
+              
+              console.log(`[Checkout Completed] Contact ID: ${contactId || 'NOT FOUND'}, Has Trial: ${hasTrial}`);
+              
+              if (contactId) {
+                await syncGHLSubscription({ contactId, subscriptionData });
+              }
+            } catch (err) {
+              console.error('[Checkout Completed] Error processing subscription:', err.message);
+              // Fall back to basic contact creation
+              await updateGHLContact({
+                email,
+                name,
+                phone,
+                ghlContactId: metadata.ghl_contact_id || null,
+                tags: [],
+                customFields: {
+                  stripe_customer_id: extractId(session.customer),
+                  stripe_checkout_id: session.id,
+                },
+              });
+            }
+          } else {
+            // No subscription, just create/update contact
+            await updateGHLContact({
+              email,
+              name,
+              phone,
+              ghlContactId: metadata.ghl_contact_id || null,
+              tags: [],
+              customFields: {
+                stripe_customer_id: extractId(session.customer),
+                stripe_checkout_id: session.id,
+              },
+            });
+          }
           break;
         }
 
         case 'customer.subscription.created': {
           const sub = event.data.object;
+          console.log(`[Subscription Created] Processing subscription ${sub.id}, customer: ${extractId(sub.customer)}`);
+          
           const fullSub = await fetchFullSubscription(sub.id);
           const hasTrial = fullSub.trial_end && fullSub.trial_end > Math.floor(Date.now() / 1000);
+          
+          console.log(`[Subscription Created] Trial end: ${fullSub.trial_end ? new Date(fullSub.trial_end * 1000).toISOString() : 'none'}, Has Trial: ${hasTrial}`);
           
           const { email, name, phone, contactId } = await processSubscriptionEvent(
             sub,
