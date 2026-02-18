@@ -100,7 +100,8 @@ async function fetchFullSubscription(subscriptionId) {
 
 // Helper: Process subscription event (created/updated/deleted)
 async function processSubscriptionEvent(sub, tags, statusOverride = null) {
-  console.log(`[processSubscriptionEvent] Processing subscription ${sub.id} with tags: ${tags.join(', ')}`);
+  console.log(`[processSubscriptionEvent] Processing subscription ${sub.id}`);
+  console.log(`[processSubscriptionEvent] Tags to apply: ${JSON.stringify(tags)}`);
   
   const fullSub = await fetchFullSubscription(sub.id);
   const metadata = fullSub.metadata || {};
@@ -115,12 +116,18 @@ async function processSubscriptionEvent(sub, tags, statusOverride = null) {
   const phone = await getPhoneFromEvent(metadata, fullSub.customer, customerDetails);
   const ghlContactId = metadata.ghl_contact_id || null;
   
-  console.log(`[processSubscriptionEvent] Email: ${email}, GHL Contact ID from metadata: ${ghlContactId || 'none'}`);
+  console.log(`[processSubscriptionEvent] Contact Info:`);
+  console.log(`  - Email: ${email || 'N/A'}`);
+  console.log(`  - Name: ${name || 'N/A'}`);
+  console.log(`  - Phone: ${phone || 'N/A'}`);
+  console.log(`  - GHL Contact ID from metadata: ${ghlContactId || 'none'}`);
   
   const subscriptionData = extractSubscriptionData(fullSub);
   if (statusOverride) {
     subscriptionData.subscription_status = statusOverride;
   }
+  
+  console.log(`[processSubscriptionEvent] Updating contact with ${tags.length} tag(s): ${tags.join(', ')}`);
   
   const contactId = await updateGHLContact({
     email,
@@ -131,13 +138,9 @@ async function processSubscriptionEvent(sub, tags, statusOverride = null) {
     customFields: subscriptionData,
   });
   
-  console.log(`[processSubscriptionEvent] Contact ID after update: ${contactId || 'NOT FOUND'}`);
-  
-  if (contactId) {
-    await syncGHLSubscription({ contactId, subscriptionData });
-  } else {
-    console.warn('[processSubscriptionEvent] No contact ID returned, skipping subscription sync');
-  }
+  console.log(`[processSubscriptionEvent] Contact update result:`);
+  console.log(`  - Contact ID: ${contactId || 'NOT FOUND'}`);
+  console.log(`  - Tags that were sent: ${JSON.stringify(tags)}`);
   
   return { email, name, phone, contactId, hasTrial: fullSub.trial_end && fullSub.trial_end > Math.floor(Date.now() / 1000) };
 }
@@ -171,54 +174,6 @@ function extractSubscriptionData(sub) {
     collection_method: sub.collection_method || null,
     days_until_due: sub.days_until_due?.toString() || null,
   };
-}
-
-// Helper: Create or update subscription in GHL (if API supports it)
-async function syncGHLSubscription({ contactId, subscriptionData }) {
-  if (!process.env.GHL_API_KEY) {
-    console.warn('[GHL] Cannot sync subscription: GHL_API_KEY not set');
-    return;
-  }
-  
-  if (!contactId) {
-    console.warn('[GHL] Cannot sync subscription: contactId is missing');
-    return;
-  }
-  
-  const subAccountId = process.env.GHL_SUB_ACCOUNT_ID;
-  const headers = getGHLHeaders();
-
-  try {
-    const subscriptionBody = {
-      ...(subAccountId && { locationId: subAccountId }),
-      contactId,
-      name: subscriptionData.plan_name || 'Stripe Subscription',
-      status: subscriptionData.subscription_status === 'active' ? 'active' : 'inactive',
-      amount: subscriptionData.subscription_amount,
-      currency: subscriptionData.subscription_currency,
-      interval: subscriptionData.subscription_interval,
-      externalId: subscriptionData.stripe_subscription_id,
-    };
-
-    console.log(`[GHL] Attempting to create subscription for contact ${contactId}...`);
-
-    const res = await fetch(`${GHL_BASE}/payments/subscriptions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(subscriptionBody),
-    });
-
-    if (!res.ok) {
-      const errorText = await res.text();
-      console.warn(`[GHL] Subscription creation failed ${res.status}: ${errorText}`);
-      console.log('[GHL] Subscription data is still stored in contact custom fields');
-    } else {
-      console.log(`[GHL] Subscription created successfully for contact ${contactId}`);
-    }
-  } catch (err) {
-    console.warn('[GHL] Subscription sync error:', err.message);
-    console.log('[GHL] Subscription data is still stored in contact custom fields');
-  }
 }
 
 // Helper: Find contact by email (fallback when ID not in response)
@@ -262,6 +217,14 @@ async function updateGHLContact({ email, name, phone, ghlContactId, tags = [], c
     tags,
     customFields: toGHLCustomFieldsArray(customFields),
   };
+  
+  console.log(`[updateGHLContact] Sending to GHL:`);
+  console.log(`  - Email: ${email || 'N/A'}`);
+  console.log(`  - Name: ${name || 'N/A'}`);
+  console.log(`  - Phone: ${phone || 'N/A'}`);
+  console.log(`  - Tags: ${JSON.stringify(tags)}`);
+  console.log(`  - GHL Contact ID (if updating): ${ghlContactId || 'none (creating new)'}`);
+  console.log(`  - Custom Fields Count: ${Object.keys(customFields).length}`);
 
   let contactId = ghlContactId;
   
@@ -359,27 +322,39 @@ app.post(
             console.log(`[Checkout Completed] Subscription detected: ${session.subscription}, processing...`);
             try {
               const fullSub = await fetchFullSubscription(session.subscription);
-              const hasTrial = fullSub.trial_end && fullSub.trial_end > Math.floor(Date.now() / 1000);
+              
+              // Detailed trial detection logging
+              const currentTimestamp = Math.floor(Date.now() / 1000);
+              const trialEnd = fullSub.trial_end;
+              const hasTrial = trialEnd && trialEnd > currentTimestamp;
+              
+              console.log(`[Checkout Completed] Trial Detection:`);
+              console.log(`  - Trial End Timestamp: ${trialEnd || 'null'}`);
+              console.log(`  - Trial End Date: ${trialEnd ? new Date(trialEnd * 1000).toISOString() : 'N/A'}`);
+              console.log(`  - Current Timestamp: ${currentTimestamp}`);
+              console.log(`  - Current Date: ${new Date().toISOString()}`);
+              console.log(`  - Trial End > Current: ${trialEnd ? trialEnd > currentTimestamp : 'N/A'}`);
+              console.log(`  - Has Active Trial: ${hasTrial}`);
+              console.log(`  - Tags to apply: ${hasTrial ? '["is_trialing"]' : '[]'}`);
               
               const subscriptionData = extractSubscriptionData(fullSub);
+              
+              const tagsToApply = hasTrial ? ['is_trialing'] : [];
+              console.log(`[Checkout Completed] Creating/updating contact with tags: ${JSON.stringify(tagsToApply)}`);
               
               const contactId = await updateGHLContact({
                 email,
                 name,
                 phone,
                 ghlContactId: metadata.ghl_contact_id || null,
-                tags: hasTrial ? ['is_trialing'] : [],
+                tags: tagsToApply,
                 customFields: {
                   ...subscriptionData,
                   stripe_checkout_id: session.id,
                 },
               });
               
-              console.log(`[Checkout Completed] Contact ID: ${contactId || 'NOT FOUND'}, Has Trial: ${hasTrial}`);
-              
-              if (contactId) {
-                await syncGHLSubscription({ contactId, subscriptionData });
-              }
+              console.log(`[Checkout Completed] Contact ID: ${contactId || 'NOT FOUND'}, Tags applied: ${JSON.stringify(tagsToApply)}`);
             } catch (err) {
               console.error('[Checkout Completed] Error processing subscription:', err.message);
               // Fall back to basic contact creation
@@ -417,18 +392,38 @@ app.post(
           console.log(`[Subscription Created] Processing subscription ${sub.id}, customer: ${extractId(sub.customer)}`);
           
           const fullSub = await fetchFullSubscription(sub.id);
-          const hasTrial = fullSub.trial_end && fullSub.trial_end > Math.floor(Date.now() / 1000);
           
-          console.log(`[Subscription Created] Trial end: ${fullSub.trial_end ? new Date(fullSub.trial_end * 1000).toISOString() : 'none'}, Has Trial: ${hasTrial}`);
+          // Detailed trial detection logging
+          const currentTimestamp = Math.floor(Date.now() / 1000);
+          const trialEnd = fullSub.trial_end;
+          const hasTrial = trialEnd && trialEnd > currentTimestamp;
+          
+          console.log(`[Subscription Created] Trial Detection:`);
+          console.log(`  - Trial End Timestamp: ${trialEnd || 'null'}`);
+          console.log(`  - Trial End Date: ${trialEnd ? new Date(trialEnd * 1000).toISOString() : 'N/A'}`);
+          console.log(`  - Current Timestamp: ${currentTimestamp}`);
+          console.log(`  - Current Date: ${new Date().toISOString()}`);
+          console.log(`  - Trial End > Current: ${trialEnd ? trialEnd > currentTimestamp : 'N/A'}`);
+          console.log(`  - Has Active Trial: ${hasTrial}`);
+          
+          const tagsToApply = hasTrial ? ['is_trialing'] : [];
+          console.log(`[Subscription Created] Tags to apply: ${JSON.stringify(tagsToApply)}`);
           
           const { email, name, phone, contactId } = await processSubscriptionEvent(
             sub,
-            hasTrial ? ['is_trialing'] : []
+            tagsToApply
           );
           
-          console.log(`[Subscription Created] Email: ${email}, Name: ${name || 'N/A'}, Phone: ${phone || 'N/A'}, Has Trial: ${hasTrial}, Contact ID: ${contactId || 'NOT FOUND'}`);
+          console.log(`[Subscription Created] Final Result:`);
+          console.log(`  - Email: ${email || 'N/A'}`);
+          console.log(`  - Name: ${name || 'N/A'}`);
+          console.log(`  - Phone: ${phone || 'N/A'}`);
+          console.log(`  - Has Trial: ${hasTrial}`);
+          console.log(`  - Contact ID: ${contactId || 'NOT FOUND'}`);
+          console.log(`  - Tags Applied: ${JSON.stringify(tagsToApply)}`);
+          
           if (!contactId) {
-            console.warn('[Subscription Created] Cannot create subscription: contactId is missing');
+            console.warn('[Subscription Created] Cannot update contact: contactId is missing');
           }
           break;
         }
