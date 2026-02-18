@@ -11,6 +11,11 @@ if (!webhookSecret) {
   console.warn('STRIPE_WEBHOOK_SECRET is not set; webhook signature verification will fail.');
 }
 
+// Constants
+const GHL_BASE = 'https://services.leadconnectorhq.com';
+const GHL_VERSION = '2021-07-28';
+const STRIPE_EXPAND_OPTIONS = ['items.data.price.product'];
+
 // Convert { key: value } to GHL format: [ { key, value } ]. Omit null/undefined values.
 function toGHLCustomFieldsArray(obj) {
   return Object.entries(obj)
@@ -18,59 +23,143 @@ function toGHLCustomFieldsArray(obj) {
     .map(([key, value]) => ({ key, value }));
 }
 
-// GHL Private Integrations use this base URL and require the Version header.
-const GHL_BASE = 'https://services.leadconnectorhq.com';
-const GHL_VERSION = '2021-07-28';
+// Helper: Extract ID from Stripe object (handles both string and object references)
+function extractId(obj) {
+  if (!obj) return null;
+  return typeof obj === 'string' ? obj : obj.id || null;
+}
 
-// Helper: Get customer email from Stripe if not provided
-async function getCustomerEmail(customerId) {
-  if (!customerId) return null;
+// Helper: Convert Unix timestamp to ISO string
+function timestampToISO(timestamp) {
+  return timestamp ? new Date(timestamp * 1000).toISOString() : null;
+}
+
+// Helper: Get GHL API headers
+function getGHLHeaders() {
+  return {
+    Authorization: `Bearer ${process.env.GHL_API_KEY}`,
+    'Content-Type': 'application/json',
+    Version: GHL_VERSION,
+  };
+}
+
+// Helper: Get customer details (email, name, phone) from Stripe if not provided
+async function getCustomerDetails(customerId) {
+  if (!customerId) return { email: null, name: null, phone: null };
   try {
-    const customer = await stripe.customers.retrieve(customerId);
-    return customer.email || null;
+    const customer = await stripe.customers.retrieve(extractId(customerId));
+    return {
+      email: customer.email || null,
+      name: customer.name || null,
+      phone: customer.phone || customer.metadata?.phone || null,
+    };
   } catch (err) {
     console.warn(`Failed to fetch customer ${customerId}:`, err.message);
-    return null;
+    return { email: null, name: null, phone: null };
   }
+}
+
+// Helper: Get email from event metadata or customer object
+async function getEmailFromEvent(metadata, customer) {
+  if (metadata?.email) return metadata.email;
+  if (customer) {
+    const details = await getCustomerDetails(customer);
+    return details.email;
+  }
+  return null;
+}
+
+// Helper: Get name from event metadata or customer object
+async function getNameFromEvent(metadata, customer, customerDetails = null) {
+  if (metadata?.name) return metadata.name;
+  if (customerDetails?.name) return customerDetails.name;
+  if (customer) {
+    const details = await getCustomerDetails(customer);
+    return details.name;
+  }
+  return null;
+}
+
+// Helper: Get phone from event metadata or customer object
+async function getPhoneFromEvent(metadata, customer, customerDetails = null) {
+  if (metadata?.phone) return metadata.phone;
+  if (customerDetails?.phone) return customerDetails.phone;
+  if (customer) {
+    const details = await getCustomerDetails(customer);
+    return details.phone;
+  }
+  return null;
+}
+
+// Helper: Fetch full subscription with expanded items
+async function fetchFullSubscription(subscriptionId) {
+  return await stripe.subscriptions.retrieve(subscriptionId, {
+    expand: STRIPE_EXPAND_OPTIONS,
+  });
+}
+
+// Helper: Process subscription event (created/updated/deleted)
+async function processSubscriptionEvent(sub, tags, statusOverride = null) {
+  const fullSub = await fetchFullSubscription(sub.id);
+  const metadata = fullSub.metadata || {};
+  
+  // Get customer details once and reuse
+  const customerDetails = fullSub.customer 
+    ? await getCustomerDetails(fullSub.customer)
+    : null;
+  
+  const email = metadata.email || customerDetails?.email || null;
+  const name = await getNameFromEvent(metadata, fullSub.customer, customerDetails);
+  const phone = await getPhoneFromEvent(metadata, fullSub.customer, customerDetails);
+  const ghlContactId = metadata.ghl_contact_id || null;
+  
+  const subscriptionData = extractSubscriptionData(fullSub);
+  if (statusOverride) {
+    subscriptionData.subscription_status = statusOverride;
+  }
+  
+  const contactId = await updateGHLContact({
+    email,
+    name,
+    phone,
+    ghlContactId,
+    tags,
+    customFields: subscriptionData,
+  });
+  
+  if (contactId) {
+    await syncGHLSubscription({ contactId, subscriptionData });
+  }
+  
+  return { email, name, phone, contactId, hasTrial: fullSub.trial_end && fullSub.trial_end > Math.floor(Date.now() / 1000) };
 }
 
 // Helper: Extract comprehensive subscription data from Stripe subscription object
 function extractSubscriptionData(sub) {
   const items = sub.items?.data || [];
-  const primaryItem = items[0];
-  const price = primaryItem?.price;
-  
-  // Extract customer ID as string (handle both string and object references)
-  const customerId = typeof sub.customer === 'string' 
-    ? sub.customer 
-    : sub.customer?.id || sub.customer || null;
+  const price = items[0]?.price;
+  const recurring = price?.recurring;
   
   return {
     stripe_subscription_id: sub.id,
-    stripe_customer_id: customerId,
+    stripe_customer_id: extractId(sub.customer),
     subscription_status: sub.status,
     subscription_currency: sub.currency,
-    subscription_interval: price?.recurring?.interval || null,
-    subscription_interval_count: price?.recurring?.interval_count || null,
+    subscription_interval: recurring?.interval || null,
+    subscription_interval_count: recurring?.interval_count || null,
     subscription_amount: price?.unit_amount ? (price.unit_amount / 100).toFixed(2) : null,
     subscription_amount_formatted: price?.unit_amount 
       ? `$${(price.unit_amount / 100).toFixed(2)}` 
       : null,
     plan_name: price?.nickname || price?.product || null,
     plan_id: price?.id || null,
-    trial_start: sub.trial_start ? new Date(sub.trial_start * 1000).toISOString() : null,
-    trial_end: sub.trial_end ? new Date(sub.trial_end * 1000).toISOString() : null,
-    current_period_start: sub.current_period_start 
-      ? new Date(sub.current_period_start * 1000).toISOString() 
-      : null,
-    current_period_end: sub.current_period_end 
-      ? new Date(sub.current_period_end * 1000).toISOString() 
-      : null,
+    trial_start: timestampToISO(sub.trial_start),
+    trial_end: timestampToISO(sub.trial_end),
+    current_period_start: timestampToISO(sub.current_period_start),
+    current_period_end: timestampToISO(sub.current_period_end),
     cancel_at_period_end: sub.cancel_at_period_end ? 'true' : 'false',
-    canceled_at: sub.canceled_at ? new Date(sub.canceled_at * 1000).toISOString() : null,
-    billing_cycle_anchor: sub.billing_cycle_anchor 
-      ? new Date(sub.billing_cycle_anchor * 1000).toISOString() 
-      : null,
+    canceled_at: timestampToISO(sub.canceled_at),
+    billing_cycle_anchor: timestampToISO(sub.billing_cycle_anchor),
     collection_method: sub.collection_method || null,
     days_until_due: sub.days_until_due?.toString() || null,
   };
@@ -78,35 +167,33 @@ function extractSubscriptionData(sub) {
 
 // Helper: Create or update subscription in GHL (if API supports it)
 async function syncGHLSubscription({ contactId, subscriptionData }) {
-  const token = process.env.GHL_API_KEY;
+  if (!process.env.GHL_API_KEY) {
+    console.warn('[GHL] Cannot sync subscription: GHL_API_KEY not set');
+    return;
+  }
+  
+  if (!contactId) {
+    console.warn('[GHL] Cannot sync subscription: contactId is missing');
+    return;
+  }
+  
   const subAccountId = process.env.GHL_SUB_ACCOUNT_ID;
-  
-  if (!token || !contactId) return; // Skip if no token or contact ID
-  
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    'Content-Type': 'application/json',
-    Version: GHL_VERSION,
-  };
+  const headers = getGHLHeaders();
 
-  // Try to create/update subscription in GHL
-  // Note: GHL subscription API may not support direct creation, so this may fail gracefully
   try {
     const subscriptionBody = {
       ...(subAccountId && { locationId: subAccountId }),
       contactId,
       name: subscriptionData.plan_name || 'Stripe Subscription',
       status: subscriptionData.subscription_status === 'active' ? 'active' : 'inactive',
-      // Map Stripe fields to GHL subscription fields if available
       amount: subscriptionData.subscription_amount,
       currency: subscriptionData.subscription_currency,
       interval: subscriptionData.subscription_interval,
-      // Store Stripe subscription ID for reference
       externalId: subscriptionData.stripe_subscription_id,
     };
 
-    // Try POST to create/update subscription (endpoint may vary)
-    // This is experimental - GHL API may not support this endpoint
+    console.log(`[GHL] Attempting to create subscription for contact ${contactId}...`);
+
     const res = await fetch(`${GHL_BASE}/payments/subscriptions`, {
       method: 'POST',
       headers,
@@ -114,36 +201,58 @@ async function syncGHLSubscription({ contactId, subscriptionData }) {
     });
 
     if (!res.ok) {
-      // If subscription endpoint doesn't exist or fails, that's okay
-      // We'll still store data in custom fields
-      console.log(`GHL subscription sync skipped (API may not support): ${res.status}`);
+      const errorText = await res.text();
+      console.warn(`[GHL] Subscription creation failed ${res.status}: ${errorText}`);
+      console.log('[GHL] Subscription data is still stored in contact custom fields');
+    } else {
+      console.log(`[GHL] Subscription created successfully for contact ${contactId}`);
     }
   } catch (err) {
-    // Silently fail - subscription creation in GHL may not be supported
-    console.log('GHL subscription sync skipped:', err.message);
+    console.warn('[GHL] Subscription sync error:', err.message);
+    console.log('[GHL] Subscription data is still stored in contact custom fields');
   }
 }
 
-// Helper: Send request to Go High Level API (Private Integration)
-async function updateGHLContact({ email, ghlContactId, tags = [], customFields = {} }) {
+// Helper: Find contact by email (fallback when ID not in response)
+async function findContactByEmail(email, headers) {
+  if (!email) return null;
+  
   const subAccountId = process.env.GHL_SUB_ACCOUNT_ID;
+  const url = `${GHL_BASE}/contacts/?email=${encodeURIComponent(email)}${subAccountId ? `&locationId=${subAccountId}` : ''}`;
+  
+  try {
+    const res = await fetch(url, { headers });
+    if (res.ok) {
+      const result = await res.json();
+      return result.contacts?.[0]?.id || null;
+    }
+  } catch (err) {
+    console.warn('[GHL] Could not search for contact by email:', err.message);
+  }
+  return null;
+}
+
+// Helper: Extract contact ID from GHL response
+function extractContactIdFromResponse(result) {
+  return result.contact?.id || result.id || result.contactId || null;
+}
+
+// Helper: Send request to Go High Level API (Private Integration)
+async function updateGHLContact({ email, name, phone, ghlContactId, tags = [], customFields = {} }) {
+  if (!process.env.GHL_API_KEY) {
+    throw new Error('GHL_API_KEY is not set');
+  }
+
+  const subAccountId = process.env.GHL_SUB_ACCOUNT_ID;
+  const headers = getGHLHeaders();
   const body = {
     ...(subAccountId && { locationId: subAccountId }),
     type: 'Customer',
     email,
+    ...(name && { name }),
+    ...(phone && { phone }),
     tags,
     customFields: toGHLCustomFieldsArray(customFields),
-  };
-
-  const token = process.env.GHL_API_KEY;
-  if (!token) {
-    throw new Error('GHL_API_KEY is not set');
-  }
-
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    'Content-Type': 'application/json',
-    Version: GHL_VERSION,
   };
 
   let contactId = ghlContactId;
@@ -159,7 +268,7 @@ async function updateGHLContact({ email, ghlContactId, tags = [], customFields =
       throw new Error(`GHL PUT contact failed ${res.status}: ${text}`);
     }
   } else {
-    // Upsert: create or update by email so we don't fail when location disallows duplicates
+    // Upsert: create or update by email
     const res = await fetch(`${GHL_BASE}/contacts/upsert`, {
       method: 'POST',
       headers,
@@ -169,12 +278,24 @@ async function updateGHLContact({ email, ghlContactId, tags = [], customFields =
       const text = await res.text();
       throw new Error(`GHL POST contact upsert failed ${res.status}: ${text}`);
     }
+    
     // Try to get contact ID from response
     try {
       const result = await res.json();
-      contactId = result.contact?.id || null;
-    } catch {
-      // Response might not be JSON, that's okay
+      contactId = extractContactIdFromResponse(result);
+      
+      if (contactId) {
+        console.log(`[GHL] Contact created/updated: ${contactId}`);
+      } else if (email) {
+        // Fallback: search by email
+        console.log(`[GHL] Contact ID not in response, searching by email: ${email}`);
+        contactId = await findContactByEmail(email, headers);
+        if (contactId) {
+          console.log(`[GHL] Found contact by email: ${contactId}`);
+        }
+      }
+    } catch (err) {
+      console.warn('[GHL] Could not parse contact ID from upsert response:', err.message);
     }
   }
   
@@ -208,29 +329,29 @@ app.post(
       switch (event.type) {
         case 'checkout.session.completed': {
           const session = event.data.object;
-          let email = session.customer_details?.email;
           const metadata = session.metadata || {};
-          const ghlContactId = metadata.ghl_contact_id || null;
-
-          // Get email from customer if not in session details
-          if (!email && session.customer) {
-            email = await getCustomerEmail(
-              typeof session.customer === 'string' 
-                ? session.customer 
-                : session.customer.id
-            );
+          
+          // Get email, name, and phone from session or customer
+          let email = session.customer_details?.email;
+          let name = session.customer_details?.name;
+          let phone = session.customer_details?.phone;
+          
+          // If not in session details, fetch from customer
+          if (session.customer && (!email || !name || !phone)) {
+            const customerDetails = await getCustomerDetails(session.customer);
+            email = email || customerDetails.email;
+            name = name || customerDetails.name;
+            phone = phone || customerDetails.phone;
           }
-
-          // Don't add trial_started here - wait for customer.subscription.created event
-          // which has the actual trial_end information
+          
           await updateGHLContact({
             email,
-            ghlContactId,
+            name,
+            phone,
+            ghlContactId: metadata.ghl_contact_id || null,
             tags: [],
             customFields: {
-              stripe_customer_id: typeof session.customer === 'string' 
-                ? session.customer 
-                : session.customer?.id || session.customer,
+              stripe_customer_id: extractId(session.customer),
               stripe_checkout_id: session.id,
             },
           });
@@ -239,123 +360,30 @@ app.post(
 
         case 'customer.subscription.created': {
           const sub = event.data.object;
-          
-          // Fetch full subscription with expanded items to get price/plan details
-          const fullSub = await stripe.subscriptions.retrieve(sub.id, {
-            expand: ['items.data.price.product'],
-          });
-          
-          const metadata = fullSub.metadata || {};
-          let email = metadata.email || null;
-          const ghlContactId = metadata.ghl_contact_id || null;
-          
-          // Get email from customer if not in metadata
-          if (!email && fullSub.customer) {
-            email = await getCustomerEmail(
-              typeof fullSub.customer === 'string' 
-                ? fullSub.customer 
-                : fullSub.customer.id
-            );
-          }
-
-          // Extract all subscription data
-          const subscriptionData = extractSubscriptionData(fullSub);
-
-          // Only add trial_started tag if subscription actually has a trial period
+          const fullSub = await fetchFullSubscription(sub.id);
           const hasTrial = fullSub.trial_end && fullSub.trial_end > Math.floor(Date.now() / 1000);
-          const tags = hasTrial ? ['trial_started'] : [];
-
-          // Update contact with all subscription data
-          const contactId = await updateGHLContact({
-            email,
-            ghlContactId,
-            tags,
-            customFields: subscriptionData,
-          });
-
-          // Try to sync subscription to GHL (may not be supported by API)
-          if (contactId) {
-            await syncGHLSubscription({ contactId, subscriptionData });
+          
+          const { email, name, phone, contactId } = await processSubscriptionEvent(
+            sub,
+            hasTrial ? ['is_trialing'] : []
+          );
+          
+          console.log(`[Subscription Created] Email: ${email}, Name: ${name || 'N/A'}, Phone: ${phone || 'N/A'}, Has Trial: ${hasTrial}, Contact ID: ${contactId || 'NOT FOUND'}`);
+          if (!contactId) {
+            console.warn('[Subscription Created] Cannot create subscription: contactId is missing');
           }
           break;
         }
 
         case 'customer.subscription.updated': {
           const sub = event.data.object;
-          
-          // Fetch full subscription with expanded items
-          const fullSub = await stripe.subscriptions.retrieve(sub.id, {
-            expand: ['items.data.price.product'],
-          });
-          
-          const metadata = fullSub.metadata || {};
-          let email = metadata.email || null;
-          const ghlContactId = metadata.ghl_contact_id || null;
-          
-          // Get email from customer if not in metadata
-          if (!email && fullSub.customer) {
-            email = await getCustomerEmail(
-              typeof fullSub.customer === 'string' 
-                ? fullSub.customer 
-                : fullSub.customer.id
-            );
-          }
-
-          // Extract all subscription data
-          const subscriptionData = extractSubscriptionData(fullSub);
-
-          // Update contact with all subscription data
-          const contactId = await updateGHLContact({
-            email,
-            ghlContactId,
-            tags: ['subscription_updated'],
-            customFields: subscriptionData,
-          });
-
-          // Try to sync subscription to GHL
-          if (contactId) {
-            await syncGHLSubscription({ contactId, subscriptionData });
-          }
+          await processSubscriptionEvent(sub, ['subscription_updated']);
           break;
         }
 
         case 'customer.subscription.deleted': {
           const sub = event.data.object;
-          
-          // Fetch full subscription details even if deleted
-          const fullSub = await stripe.subscriptions.retrieve(sub.id, {
-            expand: ['items.data.price.product'],
-          });
-          
-          const metadata = fullSub.metadata || {};
-          let email = metadata.email || null;
-          const ghlContactId = metadata.ghl_contact_id || null;
-          
-          // Get email from customer if not in metadata
-          if (!email && fullSub.customer) {
-            email = await getCustomerEmail(
-              typeof fullSub.customer === 'string' 
-                ? fullSub.customer 
-                : fullSub.customer.id
-            );
-          }
-
-          // Extract subscription data (status will be 'canceled')
-          const subscriptionData = extractSubscriptionData(fullSub);
-          subscriptionData.subscription_status = 'canceled';
-
-          // Update contact with cancellation info
-          const contactId = await updateGHLContact({
-            email,
-            ghlContactId,
-            tags: ['subscription_canceled'],
-            customFields: subscriptionData,
-          });
-
-          // Try to sync subscription cancellation to GHL
-          if (contactId) {
-            await syncGHLSubscription({ contactId, subscriptionData });
-          }
+          await processSubscriptionEvent(sub, ['subscription_canceled'], 'canceled');
           break;
         }
 
