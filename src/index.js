@@ -335,11 +335,11 @@ app.post(
               console.log(`  - Current Date: ${new Date().toISOString()}`);
               console.log(`  - Trial End > Current: ${trialEnd ? trialEnd > currentTimestamp : 'N/A'}`);
               console.log(`  - Has Active Trial: ${hasTrial}`);
-              console.log(`  - Tags to apply: ${hasTrial ? '["is_trialing"]' : '[]'}`);
+              console.log(`  - Tags to apply: ${hasTrial ? '["trial_started"]' : '[]'}`);
               
               const subscriptionData = extractSubscriptionData(fullSub);
               
-              const tagsToApply = hasTrial ? ['is_trialing'] : [];
+              const tagsToApply = hasTrial ? ['trial_started'] : [];
               console.log(`[Checkout Completed] Creating/updating contact with tags: ${JSON.stringify(tagsToApply)}`);
               
               const contactId = await updateGHLContact({
@@ -406,7 +406,7 @@ app.post(
           console.log(`  - Trial End > Current: ${trialEnd ? trialEnd > currentTimestamp : 'N/A'}`);
           console.log(`  - Has Active Trial: ${hasTrial}`);
           
-          const tagsToApply = hasTrial ? ['is_trialing'] : [];
+          const tagsToApply = hasTrial ? ['trial_started'] : [];
           console.log(`[Subscription Created] Tags to apply: ${JSON.stringify(tagsToApply)}`);
           
           const { email, name, phone, contactId } = await processSubscriptionEvent(
