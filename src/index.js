@@ -17,9 +17,11 @@ const corsOptions = corsOrigins.length
   ? {
       origin: (origin, cb) => {
         if (!origin) return cb(null, true);
-        return cb(null, corsOrigins.includes(origin));
+        const allowed = corsOrigins.includes(origin);
+        return cb(null, allowed ? origin : false);
       },
       credentials: true,
+      optionsSuccessStatus: 204,
     }
   : {};
 app.use(cors(corsOptions));
@@ -597,7 +599,7 @@ app.patch('/contact/:contactId', async (req, res) => {
 
     const headers = getGHLHeaders();
     const payload = customFieldsPayload || {};
-    if (payload.step === 10) {
+    if (payload.step === 11) {
       payload.completed_quiz = true;
     }
     const customFields = toGHLCustomFieldsArray(payload);
