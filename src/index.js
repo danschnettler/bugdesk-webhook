@@ -1,13 +1,32 @@
 import 'dotenv/config';
 import express from 'express';
+import cors from 'cors';
 import Stripe from 'stripe';
 
 const app = express();
 const port = process.env.PORT ?? 3000;
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY ?? '');
-const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-if (!webhookSecret) {
+// CORS allowlist: set CORS_ORIGIN (single) or CORS_ORIGINS (comma-separated) in production.
+// When unset (e.g. local), allow all origins for easier dev.
+const corsOrigins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+  : process.env.CORS_ORIGIN
+    ? [process.env.CORS_ORIGIN.trim()]
+    : [];
+const corsOptions = corsOrigins.length
+  ? {
+      origin: (origin, cb) => {
+        if (!origin) return cb(null, true);
+        return cb(null, corsOrigins.includes(origin));
+      },
+      credentials: true,
+    }
+  : {};
+app.use(cors(corsOptions));
+const isLocal = process.env.NODE_ENV !== 'production';
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+if (!isLocal && !webhookSecret) {
   console.warn('STRIPE_WEBHOOK_SECRET is not set; webhook signature verification will fail.');
 }
 
@@ -303,12 +322,14 @@ app.post(
   express.raw({ type: 'application/json' }),
   async (req, res) => {
     console.log('[webhook] Request received');
+    if (isLocal && (!webhookSecret || !stripe)) {
+      console.log('[webhook] Local: Stripe key/secret not set, skipping verification and processing.');
+      return res.json({ received: true });
+    }
     const sig = req.headers['stripe-signature'];
-
     if (!sig || !webhookSecret) {
       return res.status(400).send('Missing Stripe-Signature or webhook secret.');
     }
-
     let event;
     try {
       event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
@@ -316,7 +337,6 @@ app.post(
       console.error('⚠️ Webhook signature verification failed:', err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
-
     console.log('[webhook] Event verified:', event.type, event.id);
 
     try {
@@ -509,6 +529,105 @@ app.post(
 
 // JSON body parsing for any other routes (none by default)
 app.use(express.json());
+
+// --- Quiz API (GHL contact create/update for quiz flow) ---
+// POST /contact → create contact in GHL, return { contactId }
+// PATCH /contact/:contactId → update contact with quiz answers
+
+async function createGHLContact(customFields = {}) {
+  if (!process.env.GHL_API_KEY) {
+    throw new Error('GHL_API_KEY is not set');
+  }
+  const subAccountId = process.env.GHL_SUB_ACCOUNT_ID;
+  const headers = getGHLHeaders();
+  // Unique placeholder email so GHL doesn't treat every quiz as a duplicate (location may disallow duplicates)
+  const uniqueId = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  const body = {
+    ...(subAccountId && { locationId: subAccountId }),
+    type: 'Customer',
+    firstName: 'Quiz',
+    lastName: 'User',
+    email: `quiz+${uniqueId}@bugdesk.io`,
+    customFields: toGHLCustomFieldsArray(customFields),
+  };
+  const res = await fetch(`${GHL_BASE}/contacts/`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GHL POST contact failed ${res.status}: ${text}`);
+  }
+  const result = await res.json();
+  const contactId = extractContactIdFromResponse(result);
+  if (!contactId) {
+    throw new Error('GHL create contact did not return contactId');
+  }
+  return contactId;
+}
+
+app.post('/contact', async (req, res) => {
+  try {
+    const { source } = req.body || {};
+    const contactId = await createGHLContact({ source: source || 'quiz' });
+    res.json({ contactId });
+  } catch (err) {
+    console.error('[Quiz POST /contact]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/contact/:contactId', async (req, res) => {
+  try {
+    const ghlContactId = req.params.contactId;
+    const {
+      firstName,
+      lastName,
+      email,
+      phone,
+      companyName,
+      address1,
+      customFields: customFieldsPayload,
+    } = req.body || {};
+
+    if (!process.env.GHL_API_KEY) {
+      return res.status(500).json({ error: 'GHL_API_KEY is not set' });
+    }
+
+    const headers = getGHLHeaders();
+    const payload = customFieldsPayload || {};
+    if (payload.step === 10) {
+      payload.completed_quiz = true;
+    }
+    const customFields = toGHLCustomFieldsArray(payload);
+    const body = {
+      type: 'Customer',
+      ...(email != null && email !== '' && { email }),
+      ...(firstName != null && { firstName }),
+      ...(lastName != null && { lastName }),
+      ...(phone != null && phone !== '' && { phone }),
+      ...(companyName != null && { companyName }),
+      ...(address1 != null && { address1 }),
+      customFields,
+    };
+
+    const patchRes = await fetch(`${GHL_BASE}/contacts/${ghlContactId}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!patchRes.ok) {
+      const text = await patchRes.text();
+      console.error('[Quiz PATCH /contact]', patchRes.status, text);
+      return res.status(patchRes.status).json({ error: text });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[Quiz PATCH /contact]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.get('/health', (req, res) => {
   res.json({ ok: true });
