@@ -599,7 +599,7 @@ app.patch('/contact/:contactId', async (req, res) => {
 
     const headers = getGHLHeaders();
     const payload = customFieldsPayload || {};
-    if (payload.step === 11) {
+    if (payload.step === 12) {
       payload.completed_quiz = true;
     }
     const customFields = toGHLCustomFieldsArray(payload);
