@@ -571,8 +571,17 @@ async function createGHLContact(customFields = {}) {
 
 app.post('/contact', async (req, res) => {
   try {
-    const { source } = req.body || {};
-    const contactId = await createGHLContact({ source: source || 'quiz' });
+    const { utm } = req.body || {};
+    const cf = {};
+    if (utm && typeof utm === 'object') {
+      const { utm_source, utm_campaign, lander } = utm;
+      if (utm_source === 'meta') {
+        cf.lead_source = 'meta';
+      }
+      if (utm_campaign) cf.utm_campaign = utm_campaign;
+      if (lander) cf.lander = lander;
+    }
+    const contactId = await createGHLContact(cf);
     res.json({ contactId });
   } catch (err) {
     console.error('[Quiz POST /contact]', err.message);
